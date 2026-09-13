@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-s03_permission.py - Permission System
+s03_permission.py - 权限系统
 
-Three gates inserted before tool execution:
+在工具执行之前插入的三道关卡：
 
-    Gate 1: Hard deny list (rm -rf /, sudo, ...)
-    Gate 2: Rule matching (write outside workspace? destructive cmd?)
-    Gate 3: User approval (pause and wait for confirmation)
+    关卡 1：硬拒绝清单（rm -rf /、sudo 等，一律禁止）
+    关卡 2：规则匹配（写到工作区之外？破坏性命令？）
+    关卡 3：用户审批（暂停下来，等待用户确认）
 
     +----------+      +-------+      +--------------+      +---------------+
     |   User   | ---> |  LLM  | ---> | Permission   | ---> | Tool Dispatch |
@@ -20,15 +20,15 @@ Three gates inserted before tool execution:
                           +----------+ tool_result: denied or output |
                                      +-------------------------------+
 
-Only one line added to the agent loop:
+agent 循环里只新增了一行代码：
 
     if not check_permission(block):
         continue
 
-Builds on s02 (multi-tool). Usage:
+在 s02（多工具版）基础上构建。用法：
 
     python s03_permission/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+    需要：pip install anthropic python-dotenv，并在 .env 中配置 ANTHROPIC_API_KEY
 """
 
 import os
@@ -59,7 +59,7 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
 
 
-# -- From s02: tool implementations --
+# -- 来自 s02：工具实现 --
 
 def run_bash(command: str) -> str:
     try:
@@ -119,7 +119,7 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 
-# -- From s02 (unchanged): tool definitions and dispatch --
+# -- 来自 s02（未改动）：工具定义与分发 --
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -140,32 +140,60 @@ TOOL_HANDLERS = {
 }
 
 
-# -- New in s03: three-gate permission pipeline --
+# -- s03 新增：三道关卡的权限流水线 --
 
-# Gate 1: Hard deny list - always forbidden
+# 关卡 1：硬拒绝清单 —— 一律禁止
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 def check_deny_list(command: str) -> str | None:
+    """关卡 1：检查命令是否命中硬拒绝清单。
+
+    Args:
+        command: 模型要执行的 bash 命令字符串。
+
+    Returns:
+        命中时返回阻止原因；未命中返回 None（放行）。
+    """
+    # 子串匹配：命令里包含清单中任意一条即拦截
     for pattern in DENY_LIST:
         if pattern in command:
             return f"Blocked: '{pattern}' is on the deny list"
+    # 全部未命中：放行
     return None
 
 
-# Gate 2: Rule matching - context-dependent checks
+# 关卡 2：规则匹配 —— 视上下文而定的检查
+# 正则含义：只匹配"作为独立命令出现"的 rm 或 del
+# (?i)             忽略大小写
+# (?:^|[;&|()\n])  命令前必须是行首或分隔符（排除 firm、worm 这类单词误伤）
+# \s*              命令前允许空白
+# (?:rm|del)       命令本体
+# (?=\s|$|[;&|()]) 命令后必须是空白/行尾/分隔符（排除 rmdir、delta）
 DESTRUCTIVE_COMMAND_WORD = re.compile(
     r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
 )
 
 
 def contains_destructive_command(command: str) -> bool:
+    """判断命令中是否出现独立的 rm / del 删除命令。
+
+    Args:
+        command: bash 命令字符串。
+
+    Returns:
+        True 表示疑似破坏性删除命令，需要升级审批。
+    """
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
+# 规则表：每条规则 = 适用工具 + 检查函数（lambda）+ 提示消息
+# 命中规则不会直接拒绝，而是交给关卡 3 请用户裁决
 PERMISSION_RULES = [
+    # 规则一：文件类工具的路径解析后逃出工作区 -> 判为越界写
     {"tools": ["read_file", "write_file", "edit_file"],
      "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
      "message": "Writing outside workspace"},
+    # 规则二：bash 含独立 rm/del，或出现 rm / > /etc/ / chmod 777 关键字
     {"tools": ["bash"],
      "check": lambda args: contains_destructive_command(args.get("command", "")) or
      any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
@@ -173,36 +201,70 @@ PERMISSION_RULES = [
 ]
 
 def check_rules(tool_name: str, args: dict) -> str | None:
+    """关卡 2：按规则表逐条匹配本次工具调用。
+
+    Args:
+        tool_name: 工具名（如 "bash"、"write_file"）。
+        args: 模型传给工具的参数字典。
+
+    Returns:
+        命中规则时返回提示消息（升级给关卡 3 审批）；未命中返回 None。
+    """ 
     for rule in PERMISSION_RULES:
+        # 工具名在规则适用范围内，且检查函数判定命中
         if tool_name in rule["tools"] and rule["check"](args):
             return rule["message"]
     return None
 
 
-# Gate 3: User approval - wait for confirmation after rule match
+# 关卡 3：用户审批 —— 命中规则后等待用户确认
 def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    """关卡 3：在终端展示风险详情，请用户人工裁决。
+
+    Args:
+        tool_name: 工具名。
+        args: 工具参数（完整展示给用户看）。
+        reason: 关卡 2 给出的命中原因。
+
+    Returns:
+        "allow"（输入 y/yes）；其他任何输入（含直接回车）均为 "deny"。
+    """
+    # 黄色高亮提示命中原因，并完整展示将要执行的工具与参数
     print(f"\n\033[33m[permission] {reason}\033[0m")
     print(f"   Tool: {tool_name}({args})")
+    # [y/N] 中的大写 N 表示默认值：直接回车 = 拒绝
     choice = input("   Allow? [y/N] ").strip().lower()
     return "allow" if choice in ("y", "yes") else "deny"
 
 
-# Pipeline: all three gates chained
+# 流水线：三道关卡依次串联
 def check_permission(block) -> bool:
+    """权限流水线：关卡 1 -> 关卡 2 -> 关卡 3 依次过检。
+
+    Args:
+        block: 模型的 tool_use 块（含工具名 block.name 与参数 block.input）。
+
+    Returns:
+        True 放行执行；False 拒绝（agent_loop 会把 "Permission denied."
+        作为工具结果回传给模型）。
+    """
+    # 关卡 1 只针对 bash：命中硬拒绝清单 -> 红色提示，直接拦截，不询问
     if block.name == "bash":
         reason = check_deny_list(block.input.get("command", ""))
         if reason:
             print(f"\n\033[31m[blocked] {reason}\033[0m")
             return False
+    # 关卡 2：命中规则不直接拒绝，升级到关卡 3 请用户裁决
     reason = check_rules(block.name, block.input)
     if reason:
         decision = ask_user(block.name, block.input, reason)
         if decision == "deny":
             return False
+    # 三道关卡全部通过：放行
     return True
 
 
-# -- Agent loop: same as s02, with check_permission() inserted --
+# -- Agent 循环：与 s02 相同，只是插入了 check_permission() --
 
 def agent_loop(messages: list):
     while True:
@@ -222,7 +284,7 @@ def agent_loop(messages: list):
         for block in tool_calls:
             print(f"\033[36m> {block.name}\033[0m")
 
-            # s03 change: run through permission pipeline before executing
+            # s03 的改动：执行前先过一遍权限流水线
             if not check_permission(block):
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": "Permission denied."})
@@ -243,7 +305,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            # \001/\002 tell Readline the ANSI escapes have zero display width.
+            # \001/\002 告诉 Readline：这些 ANSI 转义符的显示宽度为零。
             query = input("\001\033[36m\002s03 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
