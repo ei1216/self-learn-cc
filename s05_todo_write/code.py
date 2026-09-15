@@ -174,7 +174,7 @@ class TodoManager:
             lines.append(f"{marker} {todo['content']}")
 
         done = sum(todo["status"] == "completed" for todo in self.items)
-        lines.append(f"\n({done}/{len(self.items)} completed)")
+        lines.append(f"\n({done}/{len(self.items)} 【已完成】)")
         return "\n".join(lines)
 
 
@@ -188,7 +188,7 @@ def run_todo_write(todos: list | str) -> str:
         output = TODO.update(todos)
     except ValueError as e:
         return f"Error: {e}"
-    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
+    print(f"\n\033[33m## 当前任务列表 \033[0m\n{output}")
     return output
 
 TOOLS = [
@@ -278,7 +278,7 @@ def large_output_hook(block, output):
 
 def context_inject_hook(query: str):
     """UserPromptSubmit：记录工作目录。"""
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    print(f"\033[90m[HOOK] UserPromptSubmit: 工作目录在： {WORKDIR}\033[0m")
     return None
 
 def summary_hook(messages: list):
@@ -286,7 +286,7 @@ def summary_hook(messages: list):
     tool_count = sum(1 for m in messages
                      for b in (m.get("content") if isinstance(m.get("content"), list) else [])
                      if isinstance(b, dict) and b.get("type") == "tool_result")
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    print(f"\033[90m[HOOK] Stop: 会话用到了 {tool_count} 次 tool calls\033[0m")
     return None
 
 register_hook("UserPromptSubmit", context_inject_hook)

@@ -42,13 +42,15 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# 父Agent的系统提示：告知工作目录，并提示可用 task 工具委派子任务
 SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Use task for focused exploration or a self-contained subtask."
+    f"你是一个运行在 {WORKDIR} 目录下的编码代理。"
+    "当需要进行聚焦的探索或处理一个自包含的子任务时，使用 task 工具。"
 )
+# 子Agent的系统提示：只要求完成任务并返回简洁的最终答案
 SUB_SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Complete the given task, then return a concise final answer."
+    f"你是一个运行在 {WORKDIR} 目录下的编码代理。"
+    "完成交给你的任务，然后返回一个简洁的最终答案。"
 )
 
 
@@ -433,8 +435,8 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s06: Subagent - fresh messages, final text returns")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s06: 子Agent - 全新消息列表，仅最终文本返回父对话")
+    print("输入问题，按回车发送。输入 q 退出。\n")
 
     history = []
     while True:
