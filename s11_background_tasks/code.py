@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-s11_background_tasks.py - Background Tasks
+s11_background_tasks.py - 后台任务
 
-    Main thread                              Background thread
+    主线程                                     后台线程
     +------------------------------+         +----------------------+
-    | bash(run_in_background=True) | ------> | run command          |
-    | return bg_id                 |         | queue result         |
-    | continue agent loop          | <------ +----------------------+
-    | next turn: collect           |
+    | bash(run_in_background=True) | ------> | 运行命令             |
+    | 返回 bg_id                   |         | 结果入队             |
+    | 继续执行 agent 循环          | <------ +----------------------+
+    | 下一轮:收集结果              |
     +------------------------------+
 """
 
@@ -48,14 +48,14 @@ SYSTEM = (
 )
 
 
-# -- From s04: tool implementations --
+# -- 来自 s04:工具实现 --
 
 _shell_processes: set[subprocess.Popen] = set()
 _shell_process_lock = threading.RLock()
 
 
 def _stop_process_group(process: subprocess.Popen):
-    """Stop processes that remain in the command's original process group."""
+    """停止仍留在命令原始进程组中的进程。"""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, sig)
@@ -208,7 +208,7 @@ TOOL_HANDLERS = {
 }
 
 
-# -- From s04: hooks and permission checks --
+# -- 来自 s04:钩子与权限检查 --
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
@@ -314,23 +314,38 @@ def call_tool(block) -> str:
     return str(output)
 
 
-# -- New in s11: background execution --
+# -- s11 新增:后台执行 --
 
 class BackgroundManager:
+    """后台任务管理器：负责启动后台 Bash 任务、在后台线程执行命令并收集结果。"""
+
     def __init__(self):
+        # 任务注册表：task_id -> 任务信息（tool_use_id / command / status）
         self.tasks: dict[str, dict] = {}
+        # 已完成任务的结果：task_id -> 格式化后的输出文本
         self.results: dict[str, str] = {}
+        # 已完成、等待主循环收取的任务 ID 队列（按完成先后排序）
         self._ready: list[str] = []
+        # 任务编号自增计数器，用于生成 bg_0001 这样的递增 ID
         self._counter = 0
+        # 互斥锁：共享数据同时被主线程与后台线程读写，所有访问都要加锁
         self._lock = threading.Lock()
 
     def start(self, block) -> str:
+        """校验并启动一个后台 Bash 任务，返回任务 ID（bg_XXXX）。
+
+        只接受 bash 工具调用且命令非空；先在锁内登记任务，
+        再用守护线程执行，启动失败时回滚登记。
+        """
+        # 后台执行只针对 Bash 命令，其他工具一律拒绝
         if block.name != "bash":
             raise ValueError("Only Bash commands can run in the background")
+        # 命令必须是非空字符串，缺失或纯空白都视为非法
         command = block.input.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ValueError("Bash command cannot be empty")
 
+        # 在锁内注册任务：编号自增并格式化为 4 位，初始状态为 running
         with self._lock:
             self._counter += 1
             task_id = f"bg_{self._counter:04d}"
@@ -340,6 +355,7 @@ class BackgroundManager:
                 "status": "running",
             }
 
+        # 用守护线程执行命令：不阻塞主循环，主程序退出时线程随之结束
         thread = threading.Thread(
             target=self._run,
             args=(task_id, command),
@@ -348,6 +364,7 @@ class BackgroundManager:
         try:
             thread.start()
         except Exception:
+            # 线程启动失败时回滚任务登记，保持状态一致，再向上抛出异常
             with self._lock:
                 self.tasks.pop(task_id, None)
             raise
@@ -355,23 +372,35 @@ class BackgroundManager:
         return task_id
 
     def _run(self, task_id: str, command: str):
+        """后台线程主体：真正执行命令，并把结果与最终状态写回任务表。"""
         try:
+            # 复用 s04 的同步执行函数：在独立进程组中运行命令并等待输出
             output, exit_code = _run_bash_process(command)
+            # 按退出码格式化输出，并据此判定任务最终状态
             result = _format_bash_result(output, exit_code)
             status = "completed" if exit_code == 0 else "failed"
         except Exception as error:
+            # 执行中的任何异常都记为失败，避免后台线程静默消亡、结果丢失
             result = f"Error: {type(error).__name__}: {error}"
             status = "failed"
 
+        # 在锁内写回结果；若任务已被移出注册表（如启动失败被回滚），直接丢弃
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None:
                 return
             task["status"] = status
             self.results[task_id] = result
+            # 标记为"可收取"，等待主循环在后续轮次通过 collect 取走
             self._ready.append(task_id)
 
     def collect(self) -> list[str]:
+        """收取所有已完成的任务，组装为 <task_notification> 通知文本列表。
+
+        每次调用都原子地取走全部就绪任务（取出即从注册表中删除），
+        无完成任务时返回空列表。
+        """
+        # 在锁内一次性"取走"全部就绪任务：同步 pop 任务与结果，避免重复收取
         with self._lock:
             ready = []
             for task_id in self._ready:
@@ -381,6 +410,7 @@ class BackgroundManager:
                     ready.append((task_id, task, result))
             self._ready.clear()
 
+        # 通知在锁外组装：摘要最多保留 500 字符，防止超长输出撑爆上下文
         notifications = []
         for task_id, task, result in ready:
             notifications.append(
@@ -395,7 +425,9 @@ class BackgroundManager:
         return notifications
 
 
+# 全局唯一的后台任务管理器，供本模块所有执行路径共用
 BACKGROUND = BackgroundManager()
+# 便捷别名：外部（如测试）可直接查看任务表与结果表
 background_tasks = BACKGROUND.tasks
 background_results = BACKGROUND.results
 
@@ -456,7 +488,7 @@ def execute_tool(block) -> str:
     return output
 
 
-# -- Agent loop --
+# -- Agent 循环 --
 
 def agent_loop(messages: list):
     while True:
@@ -498,7 +530,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            # \001/\002 tell Readline the ANSI escapes have zero display width.
+            # \001/\002 用于告知 Readline:这些 ANSI 转义符的显示宽度为零。
             query = input("\001\033[36m\002s11 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
