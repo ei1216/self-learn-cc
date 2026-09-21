@@ -50,75 +50,179 @@ SYSTEM = (
 
 # -- 来自 s04:工具实现 --
 
+# 全局 Shell 进程登记表：记录本模块启动且仍在运行的命令进程，供退出时统一清理
 _shell_processes: set[subprocess.Popen] = set()
+# 可重入锁：保护 _shell_processes 的并发读写；用 RLock 是因为信号处理可能在
+# 主线程持锁期间触发，同线程重复加锁时普通 Lock 会死锁
 _shell_process_lock = threading.RLock()
 
 
 def _stop_process_group(process: subprocess.Popen):
-    """停止仍留在命令原始进程组中的进程。"""
+    """停止仍留在命令原始进程组中的进程。
+
+    先发送 SIGTERM 请求优雅退出，稍候仍未结束则升级为 SIGKILL 强制终止；
+    进程组已不存在（命令已自行退出）时直接返回，不视为错误。
+
+    Args:
+        process: 由 _run_bash_process 创建的 Popen 进程对象；
+            因启动时使用 start_new_session=True，其 pid 即命令的进程组 ID。
+
+    Returns:
+        None
+    """
+    # 信号逐级升级：先 SIGTERM 温和终止，再 SIGKILL 强杀
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
+            # 对整个进程组发信号，连带清理命令派生的全部子进程
             os.killpg(process.pid, sig)
         except (ProcessLookupError, OSError):
+            # 进程组已消失，说明命令及其子进程均已退出，无需再清理
             return
+        # 短暂等待信号生效，再决定是否升级信号强度
         time.sleep(0.05)
 
 
 def _stop_all_shell_processes():
+    """停止当前所有仍在运行的 Shell 命令进程。
+
+    先在锁内对登记集合复制快照，再到锁外逐个清理，
+    避免持锁执行耗时的信号发送与等待。供 atexit 与信号处理共用。
+
+    Returns:
+        None
+    """
+    # 锁内只复制快照：防止清理期间其他线程增删集合导致遍历异常
     with _shell_process_lock:
         processes = list(_shell_processes)
+    # 锁外逐个停止进程，尽量缩短锁的持有时间
     for process in processes:
         _stop_process_group(process)
 
 
 def _handle_termination_signal(signum, _frame):
+    """处理 SIGTERM 终止信号：先清理全部 Shell 命令进程，再按惯例退出码退出。
+
+    Args:
+        signum: 操作系统传入的信号编号（本模块仅注册 SIGTERM）。
+        _frame: 信号到达时的当前栈帧，本函数不使用。
+
+    Raises:
+        SystemExit: 以 128 + 信号编号的退出码退出，
+            遵循 Unix 中"进程因信号终止"的惯例（SIGTERM 即 143）。
+    """
+    # 程序被终止前先回收命令进程组，防止孤儿进程残留
     _stop_all_shell_processes()
+    # 128 + signum 是 Unix 惯例中表示"因信号终止"的退出码
     raise SystemExit(128 + signum)
 
 
+# 解释器正常退出（含 sys.exit、主循环结束）时兜底清理 Shell 进程
 atexit.register(_stop_all_shell_processes)
+# 注册 SIGTERM 处理：进程被 kill 时也能先清理 Shell 进程再退出
 signal.signal(signal.SIGTERM, _handle_termination_signal)
 
 
 def _run_bash_process(command: str) -> tuple[str, int | None]:
+    """同步执行一条 Shell 命令，返回合并输出与退出码。
+
+    命令在独立进程组（新会话）中运行，便于整体清理其派生的全部子进程；
+    执行期间进程登记进全局集合，供退出钩子与信号处理统一终止。
+
+    Args:
+        command: 待执行的 Shell 命令字符串。
+
+    Returns:
+        二元组 (output, exit_code)：
+            output: stdout 与 stderr 直接拼接、去首尾空白后的文本，
+                超长时截断到 50000 字符，无输出时为 "(no output)"，
+                超时或启动失败时为 "Error: " 开头的错误说明。
+            exit_code: 命令退出码；超时或启动失败拿不到退出码时为 None。
+    """
+    # 先置 None：finally 中据此判断是否真的创建过进程
     process = None
     try:
+        # 创建子进程：shell=True 交由系统 Shell 解释执行；
+        # start_new_session=True 让命令进入新会话/新进程组，
+        # 这样 killpg(process.pid) 才能连带清理其全部子进程
         process = subprocess.Popen(
             command,
             shell=True,
             cwd=WORKDIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # 文本模式读取输出；非法字节用替换符代替，避免解码报错
             text=True, errors="replace",
             start_new_session=True,
         )
+        # 在锁内登记进程，让退出钩子与信号处理能找到仍在运行的命令
         with _shell_process_lock:
             _shell_processes.add(process)
+        # 阻塞等待命令结束并收集输出，超过 120 秒抛 TimeoutExpired
         stdout, stderr = process.communicate(timeout=120)
+        # stdout 与 stderr 直接拼接后去除首尾空白
         output = (stdout + stderr).strip()
+        # 截断到 50000 字符，防止超长输出撑爆上下文；空输出给占位提示
         return (output[:50000] if output else "(no output)"), process.returncode
     except subprocess.TimeoutExpired:
+        # 超时路径：输出已不可靠，进程组由 finally 统一终止
         return "Error: Timeout (120s)", None
     except OSError as error:
+        # 进程启动失败（如权限不足、资源耗尽）：返回异常摘要
         return f"Error: {type(error).__name__}: {error}", None
     finally:
         if process is not None:
+            # 无论成功、超时还是异常，都确保命令进程组被终止，不留孤儿进程
             _stop_process_group(process)
             try:
+                # 短暂等待进程真正退出，回收系统资源
                 process.wait(timeout=0.2)
             except subprocess.TimeoutExpired:
+                # 0.2 秒内未退出也不再等待，进程组已被强制清理
                 pass
+            # 从登记表中移除，避免集合无限增长
             with _shell_process_lock:
                 _shell_processes.discard(process)
 
 
 def _format_bash_result(output: str, exit_code: int | None) -> str:
+    """按退出码格式化命令结果，失败时附加错误前缀。
+
+    Args:
+        output: _run_bash_process 返回的输出文本。
+        exit_code: 命令退出码；None 表示超时或启动失败。
+
+    Returns:
+        退出码为 0 或 None 时原样返回 output（None 时输出本身已带
+        Error 前缀）；非零退出码时返回以
+        "Error: command exited with status ..." 开头的文本，
+        让模型能显式识别命令失败。
+    """
+    # 退出码 0 为成功；None 表示超时/启动失败，输出已含错误说明，原样返回
     if exit_code in (0, None):
         return output
+    # 非零退出码统一加错误前缀，显式告知模型命令执行失败
     return f"Error: command exited with status {exit_code}\n{output}"
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
+    """同步执行一条 Bash 命令并返回格式化结果（bash 工具的处理器入口）。
+
+    本函数只负责前台同步执行；后台执行在 execute_tool 中被
+    should_run_background 拦截并交给 BackgroundManager 处理，
+    后台线程也是直接调用 _run_bash_process，不会经过本函数。
+
+    Args:
+        command: 待执行的 Shell 命令字符串。
+        run_in_background: 与 TOOLS 中 bash 工具的参数声明保持一致，
+          仅用于工具 Schema 定义；凡真正进入本函数的调用一定是
+          前台同步执行，因此该参数在此不参与任何逻辑。
+
+    Returns:
+        经 _format_bash_result 格式化后的命令输出：
+        成功时为命令输出本身，失败时带 "Error: " 前缀。
+    """
+    # 解包 _run_bash_process 返回的 (output, exit_code) 二元组，
+    # 交给 _format_bash_result 按退出码统一格式化
     return _format_bash_result(*_run_bash_process(command))
 
 
